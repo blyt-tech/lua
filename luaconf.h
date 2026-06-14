@@ -168,6 +168,19 @@
 #endif
 #define LUA_FLOAT_TYPE	LUA_FLOAT_FLOAT
 
+#elif defined(BLYT_LUA_I32_F64)	/* }{ */
+/*
+** 32-bit integers and 'double' (Spike U: RV32IMAFDC / ilp32d hardware doubles).
+** lua_Integer stays int32 (matches the 32-bit console identity and the cart C
+** API width); lua_Number becomes IEEE-754 double, executed on hardware D.
+*/
+#if LUAI_IS32INT  /* use 'int' if big enough */
+#define LUA_INT_TYPE	LUA_INT_INT
+#else  /* otherwise use 'long' */
+#define LUA_INT_TYPE	LUA_INT_LONG
+#endif
+#define LUA_FLOAT_TYPE	LUA_FLOAT_DOUBLE
+
 #elif LUA_C89_NUMBERS	/* }{ */
 /*
 ** largest types available for C89 ('long' and 'double')
