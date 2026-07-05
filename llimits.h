@@ -260,6 +260,17 @@ typedef unsigned long l_uint32;
 #endif
 
 /* exponentiation */
+#if defined(BLYT_HOSTLUA_FP_SEAM)
+/*
+** ADR-0135 (blyt#223): Lua `^` is pow (transcendental, Zone-2), so route it
+** through the softfloat-backed seam to the in-house blyt-tech musl kernel. The
+** b==2 -> a*a fast path is Zone-1 (exact; native == softfloat) and is identical
+** to the emulated reference's macro below, so x^2 stays bit-for-bit matched.
+*/
+#include "blyt_fpm.h"
+#define luai_numpow(L,a,b)  \
+  ((void)L, (b == 2) ? (a)*(a) : blyt_fpm_powd(a,b))
+#endif
 #if !defined(luai_numpow)
 #define luai_numpow(L,a,b)  \
   ((void)L, (b == 2) ? (a)*(a) : l_mathop(pow)(a,b))

@@ -23,6 +23,23 @@
 #include "llimits.h"
 
 
+/*
+** ADR-0135 (blyt#223): host-Lua FP determinism seam. When BLYT_HOSTLUA_FP_SEAM
+** is defined (the host-Lua fast path build), Zone-2 transcendentals route
+** through blyt_fpm_* to the in-house blyt-tech musl generic-C kernels instead of
+** the host toolchain's libm, so the fast path reproduces the emulated softfloat
+** reference bit-for-bit. l_fpm(fn) is blyt_fpm_<fn>d in seam mode, l_mathop(fn)
+** otherwise. Zone-1 ops (sqrt/floor/ceil/fabs/fmod) and math constants keep
+** l_mathop unchanged (IEEE-mandated: native == softfloat with contraction off).
+*/
+#if defined(BLYT_HOSTLUA_FP_SEAM)
+#include "blyt_fpm.h"
+#define l_fpm(fn)	blyt_fpm_##fn##d
+#else
+#define l_fpm(fn)	l_mathop(fn)
+#endif
+
+
 #undef PI
 #define PI	(l_mathop(3.141592653589793238462643383279502884))
 
@@ -40,31 +57,31 @@ static int math_abs (lua_State *L) {
 
 
 static int math_sin (lua_State *L) {
-  lua_pushnumber(L, l_mathop(sin)(luaL_checknumber(L, 1)));
+  lua_pushnumber(L, l_fpm(sin)(luaL_checknumber(L, 1)));
   return 1;
 }
 
 
 static int math_cos (lua_State *L) {
-  lua_pushnumber(L, l_mathop(cos)(luaL_checknumber(L, 1)));
+  lua_pushnumber(L, l_fpm(cos)(luaL_checknumber(L, 1)));
   return 1;
 }
 
 
 static int math_tan (lua_State *L) {
-  lua_pushnumber(L, l_mathop(tan)(luaL_checknumber(L, 1)));
+  lua_pushnumber(L, l_fpm(tan)(luaL_checknumber(L, 1)));
   return 1;
 }
 
 
 static int math_asin (lua_State *L) {
-  lua_pushnumber(L, l_mathop(asin)(luaL_checknumber(L, 1)));
+  lua_pushnumber(L, l_fpm(asin)(luaL_checknumber(L, 1)));
   return 1;
 }
 
 
 static int math_acos (lua_State *L) {
-  lua_pushnumber(L, l_mathop(acos)(luaL_checknumber(L, 1)));
+  lua_pushnumber(L, l_fpm(acos)(luaL_checknumber(L, 1)));
   return 1;
 }
 
@@ -72,7 +89,7 @@ static int math_acos (lua_State *L) {
 static int math_atan (lua_State *L) {
   lua_Number y = luaL_checknumber(L, 1);
   lua_Number x = luaL_optnumber(L, 2, 1);
-  lua_pushnumber(L, l_mathop(atan2)(y, x));
+  lua_pushnumber(L, l_fpm(atan2)(y, x));
   return 1;
 }
 
@@ -178,18 +195,18 @@ static int math_log (lua_State *L) {
   lua_Number x = luaL_checknumber(L, 1);
   lua_Number res;
   if (lua_isnoneornil(L, 2))
-    res = l_mathop(log)(x);
+    res = l_fpm(log)(x);
   else {
     lua_Number base = luaL_checknumber(L, 2);
 #if !defined(LUA_USE_C89)
     if (base == l_mathop(2.0))
-      res = l_mathop(log2)(x);
+      res = l_fpm(log2)(x);
     else
 #endif
     if (base == l_mathop(10.0))
-      res = l_mathop(log10)(x);
+      res = l_fpm(log10)(x);
     else
-      res = l_mathop(log)(x)/l_mathop(log)(base);
+      res = l_fpm(log)(x)/l_fpm(log)(base);
   }
   lua_pushnumber(L, res);
   return 1;
@@ -197,7 +214,7 @@ static int math_log (lua_State *L) {
 
 
 static int math_exp (lua_State *L) {
-  lua_pushnumber(L, l_mathop(exp)(luaL_checknumber(L, 1)));
+  lua_pushnumber(L, l_fpm(exp)(luaL_checknumber(L, 1)));
   return 1;
 }
 
