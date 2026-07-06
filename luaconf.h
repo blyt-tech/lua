@@ -753,6 +753,35 @@
 */
 
 
+/*
+@@ BLYT_HOSTLUA_FP_SEAM (ADR-0135 Phase B, blyt#225) pins string<->number
+** conversion for the host-Lua fast path.
+**
+** The emulated / native-metal Lua path converts numbers with blyt-tech musl's
+** strtod + vfprintf float path over Berkeley SoftFloat -- a bit-exact
+** deterministic reference (ADR-0007). When Lua is compiled natively for the
+** host (WASM today; native x86-64/arm64 for the host-Lua-everywhere direction),
+** 'lua_str2number' and 'l_sprintf' would otherwise resolve to whatever
+** strtod/snprintf the host toolchain ships -- a coincidental, unpinned
+** agreement. Route them through the blyt_fpm seam instead: the SAME musl strtod
+** + vfprintf float path, compiled into the host-Lua VM under a blyt_fpm_
+** namespace (renamed so the vendored objects do not override the module libc).
+** So tostring / tonumber / string.format reproduce the reference bit-for-bit.
+**
+** This is the number-format companion to the Zone-2 transcendental seam in
+** lmathlib.c / llimits.h (same BLYT_HOSTLUA_FP_SEAM guard). It must come after
+** the default lua_str2number / l_sprintf definitions above so it overrides them.
+*/
+#if defined(BLYT_HOSTLUA_FP_SEAM)
+#include "blyt_fpm.h"
+#undef lua_str2number
+#define lua_str2number(s,p)	blyt_fpm_strtod((s), (p))
+#undef lua_strx2number
+#define lua_strx2number(s,p)	blyt_fpm_strtod((s), (p))
+#undef l_sprintf
+#define l_sprintf(s,sz,f,i)	blyt_fpm_snprintf((s), (sz), (f), (i))
+#endif
+
 
 #endif
 
