@@ -567,7 +567,9 @@ static Value *resizearray (lua_State *L , Table *t,
     return t->array;  /* nothing to be done */
   else if (newasize == 0) {  /* erasing array? */
     Value *op = t->array - oldasize;  /* original array's real address */
-    luaM_freemem(L, op, concretesize(oldasize));  /* free it */
+    /* the concrete array (Value[] + tag bytes) is byte-identical on rv32 and
+    ** host (Value is 8 B on both), so the rv32 free-size equals the host one. */
+    luaM_freemem(L, op, concretesize(oldasize), concretesize(oldasize));
     return NULL;
   }
   else {
@@ -585,7 +587,7 @@ static Value *resizearray (lua_State *L , Table *t,
       size_t tomoveb = (oldasize < newasize) ? oldasizeb : newasizeb;
       lua_assert(tomoveb > 0);
       memcpy(np - tomove, op - tomove, tomoveb);
-      luaM_freemem(L, op - oldasize, oldasizeb);  /* free old block */
+      luaM_freemem(L, op - oldasize, oldasizeb, oldasizeb);  /* free old block */
     }
     return np;
   }

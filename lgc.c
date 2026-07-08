@@ -160,6 +160,58 @@ static l_mem objsize (GCObject *o) {
 }
 
 
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+/*
+** blyt#231: host−rv32 byte divergence of a live object's WHOLE footprint (the
+** figure GC pacing counts, i.e. objsize()). Only the pointer-bearing header and
+** the pointer sub-arrays diverge; TValue/Node/Instruction/StackValue arrays and
+** string/userdata payloads are byte-identical. Subtracting this from objsize()
+** yields the rv32 footprint, matching how each sub-allocation was rv32-sized, so
+** GCmarked / gettotalbytes track the same bytes the wasm32 leg does.
+*/
+static l_mem blyt_heap_divergence (GCObject *o) {
+  switch (o->tt) {
+    case LUA_VTABLE:  /* header only (array + Node hash are non-diverging) */
+      return (l_mem)(sizeof(Table) - BLYT_RV32_SIZEOF_Table);
+    case LUA_VLCL: {
+      LClosure *cl = gco2lcl(o);
+      return (l_mem)((offsetof(LClosure, upvals) - BLYT_RV32_SIZEOF_off_LClosure_upvals)
+                     + cl->nupvalues * (sizeof(UpVal *) - BLYT_RV32_SIZEOF_ptr));
+    }
+    case LUA_VCCL:  /* header only (TValue upvalue array is non-diverging) */
+      return (l_mem)(offsetof(CClosure, upvalue) - BLYT_RV32_SIZEOF_off_CClosure_upvalue);
+    case LUA_VUSERDATA:  /* header only (UValues + data are non-diverging) */
+      return (l_mem)(offsetof(Udata, uv) - BLYT_RV32_SIZEOF_off_Udata_uv);
+    case LUA_VPROTO: {
+      Proto *p = gco2p(o);
+      return (l_mem)((sizeof(Proto) - BLYT_RV32_SIZEOF_Proto)
+                     + cast_uint(p->sizep) * (sizeof(Proto *) - BLYT_RV32_SIZEOF_ptr)
+                     + cast_uint(p->sizeupvalues) * (sizeof(Upvaldesc) - BLYT_RV32_SIZEOF_Upvaldesc)
+                     + cast_uint(p->sizelocvars) * (sizeof(LocVar) - BLYT_RV32_SIZEOF_LocVar));
+    }
+    case LUA_VTHREAD: {
+      lua_State *th = gco2th(o);
+      return (l_mem)((sizeof(LX) - BLYT_RV32_SIZEOF_LX)
+                     + cast_uint(th->nci) * (sizeof(CallInfo) - BLYT_RV32_SIZEOF_CallInfo));
+    }
+    case LUA_VSHRSTR:
+      return (l_mem)(offsetof(TString, contents) - BLYT_RV32_SIZEOF_off_TString_contents);
+    case LUA_VLNGSTR:  /* regular long string (external strings never from pure Lua) */
+      return (l_mem)(offsetof(TString, falloc) - BLYT_RV32_SIZEOF_off_TString_falloc);
+    case LUA_VUPVAL:
+      return (l_mem)(sizeof(UpVal) - BLYT_RV32_SIZEOF_UpVal);
+    default:
+      return 0;
+  }
+}
+#endif
+
+/* Object footprint the VM's GC accounting counts: rv32-modelled under the seam
+** (so GC fires as it does on the 32-bit legs), the real host size otherwise. */
+#define blyt_acct_objsize(o) \
+  BLYT_ACCT(objsize(o), (l_mem)(objsize(o) - blyt_heap_divergence(o)))
+
+
 static GCObject **getgclist (GCObject *o) {
   switch (o->tt) {
     case LUA_VTABLE: return &gco2t(o)->gclist;
@@ -290,13 +342,62 @@ void luaC_fix (lua_State *L, GCObject *o) {
 }
 
 
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+/*
+** blyt#231: rv32-equivalent whole-object size of a GC object, from its type tag
+** and host size. Only the pointer-bearing header (and, for closures, the
+** pointer-array of upvalues) diverges 64-bit vs rv32; the variable tail (string
+** bytes, CClosure TValue upvalues, userdata UValues + data) is byte-identical,
+** so it is recovered from the host size and re-based onto the rv32 header layout
+** (offsets/sizes from the generated rv32 table). Correct by construction.
+*/
+static size_t blyt_heap_rv_gcsize (lu_byte tt, size_t hostsz) {
+  switch (tt) {
+    case LUA_VSHRSTR:  /* header + (l+1) content bytes */
+      return (size_t)BLYT_RV32_SIZEOF_off_TString_contents
+             + (hostsz - offsetof(TString, contents));
+    case LUA_VLNGSTR:  /* regular long string: content from offsetof(falloc) */
+      return (size_t)BLYT_RV32_SIZEOF_off_TString_falloc
+             + (hostsz - offsetof(TString, falloc));
+    case LUA_VTABLE:
+      return (size_t)BLYT_RV32_SIZEOF_Table;
+    case LUA_VUPVAL:
+      return (size_t)BLYT_RV32_SIZEOF_UpVal;
+    case LUA_VPROTO:
+      return (size_t)BLYT_RV32_SIZEOF_Proto;
+    case LUA_VLCL: {  /* offsetof(upvals) + n * sizeof(UpVal *) */
+      size_t n = (hostsz - offsetof(LClosure, upvals)) / sizeof(UpVal *);
+      return (size_t)BLYT_RV32_SIZEOF_off_LClosure_upvals
+             + n * (size_t)BLYT_RV32_SIZEOF_ptr;
+    }
+    case LUA_VCCL: {  /* offsetof(upvalue) + n * sizeof(TValue) (TValue 16 both) */
+      size_t n = (hostsz - offsetof(CClosure, upvalue)) / sizeof(TValue);
+      return (size_t)BLYT_RV32_SIZEOF_off_CClosure_upvalue
+             + n * (size_t)BLYT_RV32_SIZEOF_TValue;
+    }
+    case LUA_VUSERDATA:  /* header diverges by a constant; UValues + data equal */
+      return hostsz
+             - (offsetof(Udata, uv) - (size_t)BLYT_RV32_SIZEOF_off_Udata_uv);
+    case LUA_VTHREAD:
+      return (size_t)BLYT_RV32_SIZEOF_LX;
+    default:
+      return hostsz;  /* not a GC object variant; identity is a safe fallback */
+  }
+}
+#define blyt_gcsz_rv(tt, hostsz) blyt_heap_rv_gcsize((tt), (hostsz))
+#else
+#define blyt_gcsz_rv(tt, hostsz) ((size_t)0)
+#endif
+
+
 /*
 ** create a new collectable object (with given type, size, and offset)
 ** and link it to 'allgc' list.
 */
 GCObject *luaC_newobjdt (lua_State *L, lu_byte tt, size_t sz, size_t offset) {
   global_State *g = G(L);
-  char *p = cast_charp(luaM_newobject(L, novariant(tt), sz));
+  char *p = cast_charp(luaM_newobject(L, novariant(tt), sz,
+                                      blyt_gcsz_rv(tt, sz)));
   GCObject *o = cast(GCObject *, p + offset);
   o->marked = luaC_white(g);
   o->tt = tt;
@@ -337,7 +438,7 @@ GCObject *luaC_newobj (lua_State *L, lu_byte tt, size_t sz) {
 ** (only closures can), and a userdata's metatable must be a table.
 */
 static void reallymarkobject (global_State *g, GCObject *o) {
-  g->GCmarked += objsize(o);
+  g->GCmarked += blyt_acct_objsize(o);
   switch (o->tt) {
     case LUA_VSHRSTR:
     case LUA_VLNGSTR: {
@@ -834,7 +935,7 @@ static void freeupval (lua_State *L, UpVal *uv) {
 
 
 static void freeobj (lua_State *L, GCObject *o) {
-  assert_code(l_mem newmem = gettotalbytes(G(L)) - objsize(o));
+  assert_code(l_mem newmem = gettotalbytes(G(L)) - blyt_acct_objsize(o));
   switch (o->tt) {
     case LUA_VPROTO:
       luaF_freeproto(L, gco2p(o));
@@ -844,12 +945,14 @@ static void freeobj (lua_State *L, GCObject *o) {
       break;
     case LUA_VLCL: {
       LClosure *cl = gco2lcl(o);
-      luaM_freemem(L, cl, sizeLclosure(cl->nupvalues));
+      size_t sz = sizeLclosure(cl->nupvalues);
+      luaM_freemem(L, cl, sz, blyt_gcsz_rv(o->tt, sz));
       break;
     }
     case LUA_VCCL: {
       CClosure *cl = gco2ccl(o);
-      luaM_freemem(L, cl, sizeCclosure(cl->nupvalues));
+      size_t sz = sizeCclosure(cl->nupvalues);
+      luaM_freemem(L, cl, sz, blyt_gcsz_rv(o->tt, sz));
       break;
     }
     case LUA_VTABLE:
@@ -860,20 +963,23 @@ static void freeobj (lua_State *L, GCObject *o) {
       break;
     case LUA_VUSERDATA: {
       Udata *u = gco2u(o);
-      luaM_freemem(L, o, sizeudata(u->nuvalue, u->len));
+      size_t sz = sizeudata(u->nuvalue, u->len);
+      luaM_freemem(L, o, sz, blyt_gcsz_rv(o->tt, sz));
       break;
     }
     case LUA_VSHRSTR: {
       TString *ts = gco2ts(o);
+      size_t sz = sizestrshr(cast_uint(ts->shrlen));
       luaS_remove(L, ts);  /* remove it from hash table */
-      luaM_freemem(L, ts, sizestrshr(cast_uint(ts->shrlen)));
+      luaM_freemem(L, ts, sz, blyt_gcsz_rv(o->tt, sz));
       break;
     }
     case LUA_VLNGSTR: {
       TString *ts = gco2ts(o);
+      size_t sz = luaS_sizelngstr(ts->u.lnglen, ts->shrlen);
       if (ts->shrlen == LSTRMEM)  /* must free external string? */
         (*ts->falloc)(ts->ud, ts->contents, ts->u.lnglen + 1, 0);
-      luaM_freemem(L, ts, luaS_sizelngstr(ts->u.lnglen, ts->shrlen));
+      luaM_freemem(L, ts, sz, blyt_gcsz_rv(o->tt, sz));
       break;
     }
     default: lua_assert(0);

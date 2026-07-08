@@ -328,6 +328,7 @@ int luaD_reallocstack (lua_State *L, int newsize, int raiseerror) {
   lua_assert(newsize <= MAXSTACK || newsize == ERRORSTACKSIZE);
   relstack(L);  /* change pointers to offsets */
   G(L)->gcstopem = 1;  /* stop emergency collection */
+  blyt_heap_mark_stack();  /* blyt#231: data stack is VM scratch, not cart heap */
   newstack = luaM_reallocvector(L, oldstack, oldsize + EXTRA_STACK,
                                    newsize + EXTRA_STACK, StackValue);
   G(L)->gcstopem = oldgcstop;  /* restore emergency collection */

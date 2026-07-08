@@ -730,7 +730,22 @@
 @@ LUAL_BUFFERSIZE is the initial buffer size used by the lauxlib
 ** buffer system.
 */
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+/*
+** blyt#231 (epic #230, ADR-0029): pin the initial auxlib buffer size to the
+** rv32/wasm32 value (pointer width 4) so the native 64-bit host-Lua VM crosses
+** the on-stack-buffer -> heap-box boundary at the byte-identical string length
+** as its wasm32 sibling. guest_heap_used must match the 32-bit canonical, which
+** requires an identical allocation SEQUENCE, not merely equal per-object sizes:
+** the default sizeof(void*) formula makes this threshold 1024 on the 64-bit host
+** vs 512 on wasm32, so the same string.rep would build a plain string on one leg
+** and a boxed external string on the other — divergent live blocks. lua_Number
+** is 8 bytes on every blyt ABI (BLYT_LUA_I32_F64), so this equals wasm's 512.
+*/
+#define LUAL_BUFFERSIZE   ((int)(16 * 4 * sizeof(lua_Number)))
+#else
 #define LUAL_BUFFERSIZE   ((int)(16 * sizeof(void*) * sizeof(lua_Number)))
+#endif
 
 
 /*

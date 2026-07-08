@@ -71,6 +71,7 @@ void luaE_setdebt (global_State *g, l_mem debt) {
 CallInfo *luaE_extendCI (lua_State *L) {
   CallInfo *ci;
   lua_assert(L->ci->next == NULL);
+  blyt_heap_mark_stack();  /* blyt#231: CallInfo is VM scratch, not cart heap */
   ci = luaM_new(L, CallInfo);
   lua_assert(L->ci->next == NULL);
   L->ci->next = ci;
@@ -158,6 +159,7 @@ static void resetCI (lua_State *L) {
 static void stack_init (lua_State *L1, lua_State *L) {
   int i;
   /* initialize stack array */
+  blyt_heap_mark_stack();  /* blyt#231: data stack is VM scratch, not cart heap */
   L1->stack.p = luaM_newvector(L, BASIC_STACK_SIZE + EXTRA_STACK, StackValue);
   L1->tbclist.p = L1->stack.p;
   for (i = 0; i < BASIC_STACK_SIZE + EXTRA_STACK; i++)
@@ -265,7 +267,8 @@ static void close_state (lua_State *L) {
   }
   luaM_freearray(L, G(L)->strt.hash, cast_sizet(G(L)->strt.size));
   freestack(L);
-  lua_assert(gettotalbytes(g) == sizeof(global_State));
+  lua_assert(gettotalbytes(g) ==
+             BLYT_ACCT(sizeof(global_State), BLYT_RV32_SIZEOF_global_State));
   (*g->frealloc)(g->ud, g, sizeof(global_State), 0);  /* free main block */
 }
 
@@ -336,8 +339,14 @@ LUA_API int lua_closethread (lua_State *L, lua_State *from) {
 LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud, unsigned seed) {
   int i;
   lua_State *L;
-  global_State *g = cast(global_State*,
-                       (*f)(ud, NULL, LUA_TTHREAD, sizeof(global_State)));
+  global_State *g;
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+  /* blyt#231: the main block is allocated directly (not via luaM), so publish
+  ** its rv32 size for the runner's shadow arena, matching what the wasm32 leg
+  ** accounts for this same bootstrap allocation. */
+  blyt_heap_publish_rv(BLYT_RV32_SIZEOF_global_State);
+#endif
+  g = cast(global_State*, (*f)(ud, NULL, LUA_TTHREAD, sizeof(global_State)));
   if (g == NULL) return NULL;
   L = &g->mainth.l;
   L->tt = LUA_VTHREAD;
@@ -368,7 +377,7 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud, unsigned seed) {
   g->gray = g->grayagain = NULL;
   g->weak = g->ephemeron = g->allweak = NULL;
   g->twups = NULL;
-  g->GCtotalbytes = sizeof(global_State);
+  g->GCtotalbytes = BLYT_ACCT(sizeof(global_State), BLYT_RV32_SIZEOF_global_State);
   g->GCmarked = 0;
   g->GCdebt = 0;
   setivalue(&g->nilvalue, 0);  /* to signal that state is not yet built */

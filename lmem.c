@@ -22,6 +22,24 @@
 #include "lstate.h"
 
 
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+/*
+** blyt#231: the rv32-equivalent size of the next physical allocation, published
+** for the native host-Lua runner's shadow arena immediately before each
+** frealloc that grows/creates a block (see lblytheap.h). Single-threaded VM, so
+** a plain global written and read back-to-back is safe.
+*/
+size_t blyt_hostlua_heap_rv_pending = BLYT_HOSTLUA_HEAP_RV_UNSET;
+#endif
+
+#if defined(BLYT_HOSTLUA_HEAP_ACCT)
+/* blyt#231: 1 when the next physical allocation is a thread's data stack /
+** CallInfo (VM execution scratch the runner excludes from guest_heap_used). Set
+** by the luaM stack sites, read+reset by the runner. See blyt_hostlua_heap.h. */
+int blyt_hostlua_heap_stack_pending = 0;
+#endif
+
+
 
 /*
 ** About the realloc function:
@@ -95,7 +113,8 @@ static void *firsttry (global_State *g, void *block, size_t os, size_t ns) {
 
 
 void *luaM_growaux_ (lua_State *L, void *block, int nelems, int *psize,
-                     unsigned size_elems, int limit, const char *what) {
+                     unsigned size_elems, unsigned size_elems_rv, int limit,
+                     const char *what) {
   void *newblock;
   int size = *psize;
   if (nelems + 1 <= size)  /* does one extra element still fit? */
@@ -113,7 +132,9 @@ void *luaM_growaux_ (lua_State *L, void *block, int nelems, int *psize,
   lua_assert(nelems + 1 <= size && size <= limit);
   /* 'limit' ensures that multiplication will not overflow */
   newblock = luaM_saferealloc_(L, block, cast_sizet(*psize) * size_elems,
-                                         cast_sizet(size) * size_elems);
+                                         cast_sizet(size) * size_elems,
+                                         cast_sizet(*psize) * size_elems_rv,
+                                         cast_sizet(size) * size_elems_rv);
   *psize = size;  /* update only when everything else is OK */
   return newblock;
 }
@@ -126,12 +147,15 @@ void *luaM_growaux_ (lua_State *L, void *block, int nelems, int *psize,
 ** error.
 */
 void *luaM_shrinkvector_ (lua_State *L, void *block, int *size,
-                          int final_n, unsigned size_elem) {
+                          int final_n, unsigned size_elem,
+                          unsigned size_elem_rv) {
   void *newblock;
   size_t oldsize = cast_sizet(*size) * size_elem;
   size_t newsize = cast_sizet(final_n) * size_elem;
   lua_assert(newsize <= oldsize);
-  newblock = luaM_saferealloc_(L, block, oldsize, newsize);
+  newblock = luaM_saferealloc_(L, block, oldsize, newsize,
+                               cast_sizet(*size) * size_elem_rv,
+                               cast_sizet(final_n) * size_elem_rv);
   *size = final_n;
   return newblock;
 }
@@ -147,11 +171,11 @@ l_noret luaM_toobig (lua_State *L) {
 /*
 ** Free memory
 */
-void luaM_free_ (lua_State *L, void *block, size_t osize) {
+void luaM_free_ (lua_State *L, void *block, size_t osize, size_t osize_rv) {
   global_State *g = G(L);
   lua_assert((osize == 0) == (block == NULL));
   callfrealloc(g, block, osize, 0);
-  g->GCdebt += cast(l_mem, osize);
+  g->GCdebt += cast(l_mem, BLYT_ACCT(osize, osize_rv));
 }
 
 
@@ -160,10 +184,13 @@ void luaM_free_ (lua_State *L, void *block, size_t osize) {
 ** collection to free some memory and then try the allocation again.
 */
 static void *tryagain (lua_State *L, void *block,
-                       size_t osize, size_t nsize) {
+                       size_t osize, size_t nsize, size_t nsize_rv) {
   global_State *g = G(L);
   if (cantryagain(g)) {
     luaC_fullgc(L, 1);  /* try to free some memory... */
+    /* re-publish: the emergency collection above may have run nested
+    ** allocations that overwrote the pending rv32 size (blyt#231). */
+    blyt_heap_publish_rv(nsize_rv);
     return callfrealloc(g, block, osize, nsize);  /* try again */
   }
   else return NULL;  /* cannot run an emergency collection */
@@ -173,43 +200,49 @@ static void *tryagain (lua_State *L, void *block,
 /*
 ** Generic allocation routine.
 */
-void *luaM_realloc_ (lua_State *L, void *block, size_t osize, size_t nsize) {
+void *luaM_realloc_ (lua_State *L, void *block, size_t osize, size_t nsize,
+                     size_t osize_rv, size_t nsize_rv) {
   void *newblock;
   global_State *g = G(L);
   lua_assert((osize == 0) == (block == NULL));
+  blyt_heap_publish_rv(nsize_rv);  /* blyt#231: size the runner's shadow arena */
   newblock = firsttry(g, block, osize, nsize);
   if (l_unlikely(newblock == NULL && nsize > 0)) {
-    newblock = tryagain(L, block, osize, nsize);
+    newblock = tryagain(L, block, osize, nsize, nsize_rv);
     if (newblock == NULL)  /* still no memory? */
       return NULL;  /* do not update 'GCdebt' */
   }
   lua_assert((nsize == 0) == (newblock == NULL));
-  g->GCdebt -= cast(l_mem, nsize) - cast(l_mem, osize);
+  g->GCdebt -= cast(l_mem, BLYT_ACCT(nsize, nsize_rv))
+               - cast(l_mem, BLYT_ACCT(osize, osize_rv));
   return newblock;
 }
 
 
 void *luaM_saferealloc_ (lua_State *L, void *block, size_t osize,
-                                                    size_t nsize) {
-  void *newblock = luaM_realloc_(L, block, osize, nsize);
+                                       size_t nsize, size_t osize_rv,
+                                       size_t nsize_rv) {
+  void *newblock = luaM_realloc_(L, block, osize, nsize, osize_rv, nsize_rv);
   if (l_unlikely(newblock == NULL && nsize > 0))  /* allocation failed? */
     luaM_error(L);
   return newblock;
 }
 
 
-void *luaM_malloc_ (lua_State *L, size_t size, int tag) {
+void *luaM_malloc_ (lua_State *L, size_t size, int tag, size_t size_rv) {
   if (size == 0)
     return NULL;  /* that's all */
   else {
     global_State *g = G(L);
-    void *newblock = firsttry(g, NULL, cast_sizet(tag), size);
+    void *newblock;
+    blyt_heap_publish_rv(size_rv);  /* blyt#231: size the runner's shadow arena */
+    newblock = firsttry(g, NULL, cast_sizet(tag), size);
     if (l_unlikely(newblock == NULL)) {
-      newblock = tryagain(L, NULL, cast_sizet(tag), size);
+      newblock = tryagain(L, NULL, cast_sizet(tag), size, size_rv);
       if (newblock == NULL)
         luaM_error(L);
     }
-    g->GCdebt -= cast(l_mem, size);
+    g->GCdebt -= cast(l_mem, BLYT_ACCT(size, size_rv));
     return newblock;
   }
 }
