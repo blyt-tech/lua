@@ -162,6 +162,31 @@ static l_mem objsize (GCObject *o) {
 
 #if defined(BLYT_HOSTLUA_HEAP_SEAM)
 /*
+** blyt#267: long strings have THREE layouts, not one. luaS_sizelngstr sizes
+** LSTRREG (content inline, no falloc/ud) as offsetof(falloc)+len+1, LSTRFIX (a
+** bare header over borrowed bytes) as offsetof(falloc), and LSTRMEM (external
+** bytes the GC must release) as the full sizeof(TString) — falloc and ud are
+** live only in that last one. The seam originally modelled all three with the
+** LSTRREG formula, on the premise that pure Lua never produces an external
+** string. That premise is false: luaL_pushresult hands a luaL_Buffer heap box to
+** lua_pushexternalstring, so EVERY string past LUAL_BUFFERSIZE is an LSTRMEM,
+** and each was over-counted by the host−rv32 width of falloc+ud (8 B). The arena
+** then quantised that to 16 B per string and scattered it further through
+** first-fit block reuse, which is why the leak presented as non-linear.
+**
+** The kind is recovered from the host size — the same idiom this seam already
+** uses to recover the LSTRREG length and the closure upvalue counts. That is
+** unambiguous because LSTRFIX is exactly offsetof(falloc), LSTRMEM is exactly
+** sizeof(TString), and every LSTRREG is larger than both: its only creators
+** (luaS_newlstr, luaV_concat, loadStringN) reserve it for len > LUAI_MAXSHORTLEN.
+** The assert pins that ordering, so a fork bump that narrows it fails to compile
+** rather than silently mis-sizing strings again.
+*/
+#define BLYT_LNGSTR_REG_MIN  (offsetof(TString, falloc) + LUAI_MAXSHORTLEN + 2)
+typedef int blyt_assert_lngstr_kinds_distinct
+  [(BLYT_LNGSTR_REG_MIN > sizeof(TString)) ? 1 : -1];
+
+/*
 ** blyt#231: host−rv32 byte divergence of a live object's WHOLE footprint (the
 ** figure GC pacing counts, i.e. objsize()). Only the pointer-bearing header and
 ** the pointer sub-arrays diverge; TValue/Node/Instruction/StackValue arrays and
@@ -196,8 +221,10 @@ static l_mem blyt_heap_divergence (GCObject *o) {
     }
     case LUA_VSHRSTR:
       return (l_mem)(offsetof(TString, contents) - BLYT_RV32_SIZEOF_off_TString_contents);
-    case LUA_VLNGSTR:  /* regular long string (external strings never from pure Lua) */
-      return (l_mem)(offsetof(TString, falloc) - BLYT_RV32_SIZEOF_off_TString_falloc);
+    case LUA_VLNGSTR:  /* three layouts (blyt#267); the live object carries its kind */
+      return (gco2ts(o)->shrlen == LSTRMEM)  /* only LSTRMEM keeps falloc/ud */
+               ? (l_mem)(sizeof(TString) - BLYT_RV32_SIZEOF_TString)
+               : (l_mem)(offsetof(TString, falloc) - BLYT_RV32_SIZEOF_off_TString_falloc);
     case LUA_VUPVAL:
       return (l_mem)(sizeof(UpVal) - BLYT_RV32_SIZEOF_UpVal);
     default:
@@ -356,9 +383,14 @@ static size_t blyt_heap_rv_gcsize (lu_byte tt, size_t hostsz) {
     case LUA_VSHRSTR:  /* header + (l+1) content bytes */
       return (size_t)BLYT_RV32_SIZEOF_off_TString_contents
              + (hostsz - offsetof(TString, contents));
-    case LUA_VLNGSTR:  /* regular long string: content from offsetof(falloc) */
-      return (size_t)BLYT_RV32_SIZEOF_off_TString_falloc
-             + (hostsz - offsetof(TString, falloc));
+    case LUA_VLNGSTR:  /* three layouts (blyt#267); kind recovered from hostsz */
+      if (hostsz == sizeof(TString))  /* LSTRMEM: falloc/ud live */
+        return (size_t)BLYT_RV32_SIZEOF_TString;
+      else if (hostsz == offsetof(TString, falloc))  /* LSTRFIX: bare header */
+        return (size_t)BLYT_RV32_SIZEOF_off_TString_falloc;
+      else  /* LSTRREG: content inline from offsetof(falloc) */
+        return (size_t)BLYT_RV32_SIZEOF_off_TString_falloc
+               + (hostsz - offsetof(TString, falloc));
     case LUA_VTABLE:
       return (size_t)BLYT_RV32_SIZEOF_Table;
     case LUA_VUPVAL:
