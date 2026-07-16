@@ -11,6 +11,7 @@
 #include <stddef.h>
 
 
+#include "lblytheap.h"  /* blyt#267: BLYT_RV32_SIZEOF_* for the GC-pacing pins */
 #include "lobject.h"
 #include "lstate.h"
 
@@ -198,7 +199,23 @@
 #define LUAI_GCMUL      200
 
 /* How many bytes to allocate before next GC step */
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+/*
+** blyt#267: pin the step size to the rv32 canonical. GC PACING is part of the
+** determinism contract, not just object sizes: guest_heap_used is read after a
+** collection, and when the collector sweeps at different points the two legs
+** free — and therefore recycle — arena blocks in a different order, which the
+** first-fit allocator turns into a divergent cart_allocations (ADR-0029).
+** sizeof(Table) is 56 on a 64-bit host vs 28 on rv32/wasm32, which alone would
+** make the host VM run a step every ~2x as many bytes as the 32-bit legs. Same
+** reasoning as the LUAL_BUFFERSIZE pin in luaconf.h (blyt#231): a host-width
+** constant that is observable through the cart-facing API has to be pinned to
+** the 32-bit canonical, not merely have its objects re-sized.
+*/
+#define LUAI_GCSTEPSIZE	(200 * BLYT_RV32_SIZEOF_Table)
+#else
 #define LUAI_GCSTEPSIZE	(200 * sizeof(Table))
+#endif
 
 
 #define setgcparam(g,p,v)  (g->gcparams[LUA_GCP##p] = luaO_codeparam(v))

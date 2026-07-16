@@ -1839,6 +1839,21 @@ void luaC_runtilstate (lua_State *L, int state, int fast) {
 
 
 /*
+** blyt#267: pointer width used to convert a step's byte budget into work units
+** ("one new allocated word" -> one unit). Pinned to the rv32 canonical under the
+** seam: on a 64-bit host the upstream sizeof(void*) is 8 vs 4 on rv32/wasm32, so
+** the host VM would do HALF the work per step and sweep at different points than
+** the 32-bit legs — divergent free/recycle order, and so a divergent
+** cart_allocations (see LUAI_GCSTEPSIZE in lgc.h for the full reasoning).
+*/
+#if defined(BLYT_HOSTLUA_HEAP_SEAM)
+#define BLYT_GC_WORDSIZE  cast_int(BLYT_RV32_SIZEOF_ptr)
+#else
+#define BLYT_GC_WORDSIZE  cast_int(sizeof(void*))
+#endif
+
+
+/*
 ** Performs a basic incremental step. The step size is
 ** converted from bytes to "units of work"; then the function loops
 ** running single steps until adding that many units of work or
@@ -1847,7 +1862,7 @@ void luaC_runtilstate (lua_State *L, int state, int fast) {
 */
 static void incstep (lua_State *L, global_State *g) {
   l_mem stepsize = applygcparam(g, STEPSIZE, 100);
-  l_mem work2do = applygcparam(g, STEPMUL, stepsize / cast_int(sizeof(void*)));
+  l_mem work2do = applygcparam(g, STEPMUL, stepsize / BLYT_GC_WORDSIZE);
   l_mem stres;
   int fast = (work2do == 0);  /* special case: do a full collection */
   do {  /* repeat until enough work */
